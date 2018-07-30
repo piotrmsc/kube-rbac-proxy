@@ -42,10 +42,16 @@ import (
 	certutil "k8s.io/client-go/util/cert"
 )
 
+type configfile struct {
+	AuthorizationConfig *AuthzConfig `json:"authorization,omitempty"`
+}
+
 type config struct {
 	insecureListenAddress  string
 	secureListenAddress    string
 	upstream               string
+	urlRewriteFrom         string
+	urlRewriteTo           string
 	upstreamForceH2C       bool
 	resourceAttributesFile string
 	auth                   AuthConfig
@@ -61,7 +67,7 @@ type tlsConfig struct {
 
 type AuthInterface interface {
 	authenticator.Request
-	authorizer.RequestAttributesGetter
+	RequestAttributesGetter
 	authorizer.Authorizer
 	// handler for authenticating/authorizing http requests
 	AuthHandler
@@ -99,6 +105,8 @@ func main() {
 	flagset.StringVar(&cfg.insecureListenAddress, "insecure-listen-address", "", "The address the kube-rbac-proxy HTTP server should listen on.")
 	flagset.StringVar(&cfg.secureListenAddress, "secure-listen-address", "", "The address the kube-rbac-proxy HTTPs server should listen on.")
 	flagset.StringVar(&cfg.upstream, "upstream", "", "The upstream URL to proxy to once requests have successfully been authenticated and authorized.")
+	flagset.StringVar(&cfg.urlRewriteFrom, "url-rewrite-from", "", "Optional rewrite rule to perform before proxying the request to the upstream. Related with --url-rewrite-to. Both must be specified.")
+	flagset.StringVar(&cfg.urlRewriteTo, "url-rewrite-to", "", "Optional rewrite rule to perform before proxying the request to the upstream. Related with --url-rewrite-from. Both must be specified.")
 	flagset.BoolVar(&cfg.upstreamForceH2C, "upstream-force-h2c", false, "Force h2c to communiate with the upstream. This is required when the upstream speaks h2c(http/2 cleartext - insecure variant of http/2) only. For example, go-grpc server in the insecure mode, such as helm's tiller w/o TLS, speaks h2c only")
 	flagset.StringVar(&cfg.resourceAttributesFile, "resource-attributes-file", "", "File spec of attributes-record to use for SubjectAccessReview. If unspecified, requests will attempted to be verified through non-resource-url attributes in the SubjectAccessReview.")
 
@@ -137,9 +145,21 @@ func main() {
 			glog.Fatalf("Failed to read resource-attribute file: %v", err)
 		}
 
-		err = yaml.Unmarshal(b, &cfg.auth.Authorization.ResourceAttributes)
+		configfile := configfile{}
+		err = yaml.Unmarshal(b, &configfile)
 		if err != nil {
-			glog.Fatalf("Failed to parse resource-attribute file content: %v", err)
+			glog.Fatalf("Failed to parse config file content: %v", err)
+		}
+
+		cfg.auth.Authorization = configfile.AuthorizationConfig
+	}
+
+	var rewriteRule *RewriteRule = nil
+	if cfg.urlRewriteFrom != "" && cfg.urlRewriteTo != "" {
+		glog.Infof("Rewriting enabled. From: %#+v To: %#+v", cfg.urlRewriteFrom, cfg.urlRewriteTo)
+		rewriteRule, err = NewRewriteRule(cfg.urlRewriteFrom, cfg.urlRewriteTo)
+		if err != nil {
+			glog.Fatalf("Failed to create create rewrite rule: %v", err)
 		}
 	}
 
@@ -154,6 +174,14 @@ func main() {
 		ok := auth.Handle(w, req)
 		if !ok {
 			return
+		}
+
+		if rewriteRule != nil {
+			err := rewriteRule.Execute(req)
+			if err != nil {
+				glog.Errorf("Failed to rewrite request: %v", err)
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+			}
 		}
 
 		proxy.ServeHTTP(w, req)
